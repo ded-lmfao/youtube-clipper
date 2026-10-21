@@ -11,6 +11,16 @@ A SaaS tool that allows users to extract specific clips from YouTube videos by p
 - **Video Processing:** Uses `yt-dlp` and `ffmpeg` for efficient, compatible video clipping
 - **No cloud storage required:** Clips are downloaded directly to your device
 
+The clipping flow runs locally without Supabase, login, or a subscription. Both
+servers listen only on loopback. Finished clips are downloaded as `clip.mp4`
+through your browser; no public download link is created. Set your browser's
+download location to your Downloads folder and disable “Ask where to save each
+file” if you want downloads to save there automatically.
+
+Temporary clips live in `backend/uploads` and are removed after the browser
+receives the download. Interrupted downloads may leave temporary files there;
+job status is held in memory and resets when the backend restarts.
+
 ---
 
 ## Prerequisites
@@ -64,9 +74,52 @@ cd ../frontend
 bun install
 ```
 
+On Windows, install Bun from PowerShell if it is not already installed:
+
+```powershell
+powershell -c "irm bun.sh/install.ps1 | iex"
+```
+
+Restart PowerShell after installation, then install the dependencies:
+
+```powershell
+cd backend
+bun install
+cd ..\frontend
+bun install
+```
+
 ---
 
 ### 3. Run the app
+
+To start the backend first and then the frontend with one command, run this from the repository root:
+
+```sh
+bash run-dev.sh
+```
+
+Press `Ctrl+C` to stop both development servers.
+
+On Windows PowerShell, use:
+
+```powershell
+.\run-dev.ps1
+```
+
+If you are currently inside the `backend` directory, use:
+
+```powershell
+..\run-dev.ps1
+```
+
+If PowerShell blocks the script because of the execution policy, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ..\run-dev.ps1
+```
+
+You can also start each server separately:
 
 #### Start the backend
 
@@ -130,6 +183,11 @@ youtube-clipper/
 
 - **yt-dlp or ffmpeg not found:**  
   Make sure both are installed and available in your system PATH.
+  On Windows, use `yt-dlp.exe` on PATH (or in `backend/bin`); the bundled
+  extensionless `yt-dlp` is for Unix systems.
+  You can also place `ffmpeg.exe` and `ffprobe.exe` in `backend/bin`; the
+  backend and yt-dlp will use them without changing your system PATH.
+  Restart the backend after installing these tools.
 - **Video fails to upload to Twitter:**  
   The backend re-encodes all clips for Twitter compatibility. If you still have issues, ensure your ffmpeg is up to date.
 - **Port conflicts:**  

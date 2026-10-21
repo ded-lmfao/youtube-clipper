@@ -4,34 +4,23 @@ import cors from "cors";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
-import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "crypto";
 
 dotenv.config();
-
-// --- Supabase setup ---
-const supabaseUrl = process.env.SUPABASE_URL as string;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY as string;
-const bucketName = process.env.SUPABASE_BUCKET || 'videos';
-if (!supabaseUrl || !supabaseServiceKey) {
-  throw new Error('Supabase credentials are not set in environment variables');
-}
-const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-  auth: { persistSession: false }
-});
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-const allowedOrigin = process.env.NODE_ENV === "production" 
-  ? "https://clippa.in" 
-  : "http://localhost:3000";
-
-const corsOptions: cors.CorsOptions = {
-  origin: allowedOrigin,
-  credentials: true,
-};
-
-app.use(cors(corsOptions));
+const allowedOrigin = "http://localhost:3000";
+app.use((req, res, next) => {
+  if (!["localhost", "127.0.0.1", "[::1]"].includes(req.hostname) ||
+      (req.headers.origin && ![allowedOrigin, "http://127.0.0.1:3000"].includes(req.headers.origin))) {
+    return res.status(403).json({ error: "Local requests only" });
+  }
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
 const uploadsDir = path.join(__dirname, "../uploads");
@@ -39,23 +28,22 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir);
 }
 
-const jobsDir = path.join(__dirname, "../jobs");
-if (!fs.existsSync(jobsDir)) {
-  fs.mkdirSync(jobsDir);
-}
-
 interface Job {
   id: string;
   status: 'processing' | 'ready' | 'error';
-  filePath?: string;
-  storagePath?: string;
-  publicUrl?: string;
+  filePath: string;
   error?: string;
 }
-
-function createJobId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
+const jobs = new Map<string, Job>();
+const bundledYtDlp = path.resolve(__dirname, process.platform === 'win32' ? '../bin/yt-dlp.exe' : '../bin/yt-dlp');
+const ytDlpPath = fs.existsSync(bundledYtDlp) ? bundledYtDlp : 'yt-dlp';
+const bundledFfmpeg = path.resolve(__dirname, '../bin/ffmpeg.exe');
+const ffmpegPath = process.platform === 'win32' && fs.existsSync(bundledFfmpeg) ? bundledFfmpeg : 'ffmpeg';
+const ytDlpToolArgs = [
+  '--js-runtimes', `bun:${process.execPath}`,
+  ...(ffmpegPath === bundledFfmpeg ? ['--ffmpeg-location', path.dirname(bundledFfmpeg)] : []),
+];
+function createJobId() { return randomUUID(); }
 
 function timeToSeconds(timeStr: string): number {
   const parts = timeStr.split(':');
@@ -90,33 +78,27 @@ async function adjustSubtitleTimestamps(inputPath: string, outputPath: string, s
 }
 
 app.post("/api/clip", async (req, res) => {
-  const { url, startTime, endTime, subtitles, formatId, userId } = req.body || {};
-  if (!url || !startTime || !endTime || !userId) {
-    return res.status(400).json({ error: "url, startTime, endTime and userId are required" });
+  const { url, startTime, endTime, subtitles, formatId } = req.body || {};
+  let videoUrl: URL;
+  try { videoUrl = new URL(url); } catch {
+    return res.status(400).json({ error: "A YouTube URL is required" });
   }
-
+  if (videoUrl.protocol !== 'https:' || !['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'].includes(videoUrl.hostname)) {
+    return res.status(400).json({ error: "Use an HTTPS YouTube URL" });
+  }
+  const timestamp = /^\d{2}:[0-5]\d:[0-5]\d$/;
+  if (typeof startTime !== 'string' || typeof endTime !== 'string' || !timestamp.test(startTime) || !timestamp.test(endTime) || timeToSeconds(endTime) <= timeToSeconds(startTime)) {
+    return res.status(400).json({ error: "Use HH:MM:SS timestamps with end after start" });
+  }
+  if ((formatId !== undefined && typeof formatId !== 'string') || (subtitles !== undefined && typeof subtitles !== 'boolean')) {
+    return res.status(400).json({ error: "Invalid format or subtitles option" });
+  }
   const id = createJobId();
   const outputPath = path.join(uploadsDir, `clip-${id}.mp4`);
-  
-  const initialJobData = {
-    id,
-    user_id: userId,
-    status: 'processing',
-  };
-
-  const { error: insertError } = await supabase
-    .from('jobs')
-    .insert([initialJobData]);
-
-  if (insertError) {
-    console.error(`[job ${id}] failed to create job in database`, insertError);
-    return res.status(500).json({ error: 'Failed to create job' });
-  }
-
-  console.log(`[job ${id}] created and saved to database.`);
+  const job: Job = { id, status: 'processing', filePath: outputPath };
+  jobs.set(id, job);
 
   (async () => {
-    let finalJobStatus: { [key: string]: any } = {};
     let tempCookiesPath: string | null = null;
     try {
       const section = `*${startTime}-${endTime}`;
@@ -129,6 +111,7 @@ app.post("/api/clip", async (req, res) => {
       }
 
       const ytArgs = [
+        ...ytDlpToolArgs,
         url,
       ];
       if (formatId) {
@@ -139,6 +122,9 @@ app.post("/api/clip", async (req, res) => {
       ytArgs.push(
         "--download-sections",
         section,
+        // Decode at the cut boundary instead of retaining video from an earlier
+        // keyframe, which can play out of sync with the trimmed audio.
+        "--force-keyframes-at-cuts",
         "-o",
         outputPath,
         "--merge-output-format",
@@ -171,7 +157,7 @@ app.post("/api/clip", async (req, res) => {
       }
 
       console.log(`[job ${id}] starting yt-dlp`);
-      const yt = spawn(path.resolve(__dirname, '../bin/yt-dlp'), ytArgs);
+      const yt = spawn(ytDlpPath, ytArgs);
       yt.stderr.on('data', d => console.error(`[job ${id}]`, d.toString()));
 
       await new Promise<void>((resolve, reject) => {
@@ -233,7 +219,7 @@ app.post("/api/clip", async (req, res) => {
         );
 
         console.log(`[job ${id}] running ffmpeg`, ffmpegArgs.join(' '));
-        const ff = spawn('ffmpeg', ffmpegArgs);
+        const ff = spawn(ffmpegPath, ffmpegArgs);
         
         // Add timeout for ffmpeg process
         const ffmpegTimeout = setTimeout(() => {
@@ -252,7 +238,10 @@ app.post("/api/clip", async (req, res) => {
             reject(new Error(`ffmpeg exited with code ${code}`));
           }
         });
-        ff.on('error', reject);
+        ff.on('error', (error) => {
+          clearTimeout(ffmpegTimeout);
+          reject(error);
+        });
       });
 
       await fs.promises.unlink(outputPath).catch(()=>{});
@@ -262,51 +251,15 @@ app.post("/api/clip", async (req, res) => {
         await fs.promises.unlink(subPath).catch(() => {});
       }
 
-      // ---- Upload processed clip to Supabase ----
-      const objectPath = `clip-${id}.mp4`;
-      console.log(`[job ${id}] uploading to Supabase: ${objectPath}`);
-      const fileBuffer = await fs.promises.readFile(outputPath);
-      const { error: uploadError } = await supabase.storage
-        .from(bucketName)
-        .upload(objectPath, fileBuffer, {
-          contentType: 'video/mp4',
-          upsert: true,
-        });
-      if (uploadError) throw uploadError;
-
-      console.log(`[job ${id}] upload successful, getting public URL`);
-      const { data: pub } = supabase.storage
-        .from(bucketName)
-        .getPublicUrl(objectPath);
-
-      // Remove local file after upload
-      await fs.promises.unlink(outputPath).catch(() => {});
-
-      finalJobStatus = {
-        storage_path: objectPath,
-        public_url: pub.publicUrl,
-        status: 'ready',
-      };
-
-      console.log(`[job ${id}] ready - storagePath: ${finalJobStatus.storage_path}, publicUrl: ${finalJobStatus.public_url}`);
+      job.status = 'ready';
     } catch (err: unknown) {
       console.error(`[job ${id}] failed`, err);
       const message = err instanceof Error ? err.message : String(err);
-      finalJobStatus = {
-        status: 'error',
-        error: message,
-      };
+      job.status = 'error';
+      job.error = message;
     } finally {
       if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
         fs.unlinkSync(tempCookiesPath);
-      }
-      const { error: updateError } = await supabase
-        .from('jobs')
-        .update(finalJobStatus)
-        .eq('id', id);
-
-      if (updateError) {
-        console.error(`[job ${id}] failed to update final job status in database`, updateError);
       }
     }
   })();
@@ -314,85 +267,32 @@ app.post("/api/clip", async (req, res) => {
   return res.status(202).json({ id });
 });
 
-app.get('/api/clip/:id', async (req, res) => {
-  const { id } = req.params;
-  
-  const { data: job, error } = await supabase
-    .from('jobs')
-    .select('*')
-    .eq('id', id)
-    .single();
-
-  if (error || !job) {
-    console.log(`[job ${id}] not found in database. Error:`, error?.message);
-    return res.status(404).json({ error: 'job not found'});
-  }
-  
-  return res.json({ 
-    status: job.status, 
-    error: job.error, 
-    url: job.public_url,
-    storagePath: job.storage_path 
-  });
+app.get('/api/clip/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  return res.json({ status: job.status, error: job.error });
 });
 
-// Cleanup endpoint for frontend to delete files after download
 app.delete('/api/clip/:id/cleanup', async (req, res) => {
-  const { id } = req.params;
-
-  // Delete the job row from database
-  const { error } = await supabase
-    .from('jobs')
-    .delete()
-    .eq('id', id);
-
-  if (error && error.code !== 'PGRST116') {
-    console.error(`[job ${id}] job cleanup delete error:`, error);
-    return res.status(500).json({ error: 'Job cleanup failed' });
+  const job = jobs.get(req.params.id);
+  if (!job) return res.json({ success: true });
+  if (job.status === 'processing') return res.status(409).json({ error: 'Job still processing' });
+  try {
+    await fs.promises.rm(job.filePath, { force: true });
+    jobs.delete(job.id);
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: 'Could not remove temporary clip' });
   }
-
-  console.log(`[job ${id}] job metadata cleaned up successfully from database`);
-  return res.json({ success: true });
 });
 
-// Stream or download the generated clip directly from the backend
 app.get('/api/clip/:id/file', (req, res) => {
-  const { id } = req.params;
-  const filePath = path.join(uploadsDir, `clip-${id}.mp4`);
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'file not found' });
-  }
-
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  if (range) {
-    // Parse the Range header to support partial requests
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunkSize = end - start + 1;
-
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type': 'video/mp4',
-      'Content-Disposition': 'attachment; filename="clip.mp4"',
-    });
-
-    const stream = fs.createReadStream(filePath, { start, end });
-    stream.pipe(res);
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': 'video/mp4',
-      'Content-Disposition': 'attachment; filename="clip.mp4"',
-    });
-    fs.createReadStream(filePath).pipe(res);
-  }
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'ready') return res.status(409).json({ error: 'Job not ready' });
+  return res.download(job.filePath, 'clip.mp4', (error) => {
+    if (error && !res.headersSent) res.status(500).json({ error: 'Could not download clip' });
+  });
 });
 
 app.get("/api/formats", async (req, res) => {
@@ -403,7 +303,7 @@ app.get("/api/formats", async (req, res) => {
 
   let tempCookiesPath: string | null = null;
   try {
-    const ytDlpPath = path.resolve(__dirname, '../bin/yt-dlp');
+
     
     const prodCookiesPath = '/etc/secrets/cookies.txt';
     if (fs.existsSync(prodCookiesPath)) {
@@ -414,6 +314,7 @@ app.get("/api/formats", async (req, res) => {
     }
     
     const ytArgs = [
+      ...ytDlpToolArgs,
       '-j', 
       '--no-warnings',
       '--no-check-certificates',
@@ -538,62 +439,6 @@ app.get('/api/ping', (_req, res) => {
 
 app.get("/", (req, res) => res.send("Server is alive!"));
 
-// Test Supabase connection
-app.get("/api/test-supabase", async (req, res) => {
-  try {
-    console.log("Testing Supabase connection...");
-    console.log("Bucket name:", bucketName);
-    
-    // Test bucket access
-    const { data: buckets, error: bucketError } = await supabase.storage.listBuckets();
-    if (bucketError) {
-      console.error("Bucket list error:", bucketError);
-      return res.status(500).json({ error: "Failed to list buckets", details: bucketError });
-    }
-    
-    console.log("Available buckets:", buckets?.map(b => b.name));
-    
-    // Test bucket contents
-    const { data: files, error: fileError } = await supabase.storage.from(bucketName).list();
-    if (fileError) {
-      console.error("File list error:", fileError);
-      return res.status(500).json({ error: "Failed to list files", details: fileError });
-    }
-    
-    console.log("Files in bucket:", files?.map(f => f.name));
-    
-    return res.json({ 
-      success: true, 
-      bucketName,
-      buckets: buckets?.map(b => b.name),
-      files: files?.map(f => f.name)
-    });
-  } catch (err) {
-    console.error("Supabase test error:", err);
-    return res.status(500).json({ error: "Supabase test failed", details: err });
-  }
-});
-
-// Clean up old job files on startup
-async function cleanupOldJobs() {
-  const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  
-  console.log('Cleaning up old jobs from database...');
-  const { data, error } = await supabase
-    .from('jobs')
-    .delete()
-    .lt('created_at', twentyFourHoursAgo);
-  
-  if (error) {
-    console.error('Error during database job cleanup:', error);
-  } else if (data) {
-    console.log(`Cleaned up old jobs from database.`);
-  }
-}
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-  console.log(`Environment: ${process.env.NODE_ENV}`);
-  console.log(`CORS origin: ${allowedOrigin}`);
-  cleanupOldJobs();
+export const server = app.listen(Number(port), '127.0.0.1', () => {
+  console.log(`Local clipper running at http://localhost:${port}`);
 });

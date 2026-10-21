@@ -1,5 +1,4 @@
 "use client";
-import { authClient } from "@/lib/auth-client"; // import the auth client
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,15 +6,14 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
   Loader2,
-  LogOut,
   Monitor,
   Smartphone,
   Square,
   ArrowDown,
 } from "lucide-react";
 import Image from "next/image";
-import Buy from "@/components/buy";
 import { motion, AnimatePresence } from "motion/react";
+import { getVideoId } from "@/lib/youtube";
 
 export default function Editor() {
   const [url, setUrl] = useState("");
@@ -23,7 +21,7 @@ export default function Editor() {
   const [endTime, setEndTime] = useState("00:00:00");
   const [addSubs, setAddSubs] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [isPremium, setIsPremium] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
   const [metadata, setMetadata] = useState<{
     title?: string;
@@ -36,109 +34,63 @@ export default function Editor() {
   >("original");
   const [formats, setFormats] = useState<{format_id: string, label: string}[]>([]);
   const [selectedFormat, setSelectedFormat] = useState<string>('');
-  const [isMetadataLoading, setIsMetadataLoading] = useState(true);
-  const { data: session } = authClient.useSession();
+  const [isMetadataLoading, setIsMetadataLoading] = useState(false);
+  const [isFormatsLoading, setIsFormatsLoading] = useState(false);
+  const [formatsError, setFormatsError] = useState<string | null>(null);
   const [downloadCount, setDownloadCount] = useState(0);
-  const [showPremiumModal, setShowPremiumModal] = useState(false);
-  const getVideoId = (url: string) => {
-    const regExp =
-      /^.*((youtu.be\/)|(v\/)|(\/u\/\w\/)|(embed\/)|(watch\?))\??v?=?([^#&?]*).*/;
-    const match = url.match(regExp);
-    return match && match[7].length === 11 ? match[7] : null;
-  };
-
-  const fetchVideoMetadata = async (videoId: string | null) => {
-    if (!videoId) return;
-    setIsMetadataLoading(true);
-
-    try {
-      const url = `https://www.youtube.com/watch?v=${videoId}`;
-      const metadataResponse = await fetch(
-        `/api/metadata?url=${encodeURIComponent(url)}`
-      );
-      if (!metadataResponse.ok) throw new Error("Failed to fetch video metadata");
-      const metadata = await metadataResponse.json();
-
-      setMetadata({
-        title: metadata.title,
-        description: metadata.description,
-        thumbnail: metadata.thumbnail,
-      });
-      setThumbnailUrl(
-        metadata.image
-          ? metadata.image
-          : `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`
-      );
-
-      // Fetch formats
-      const formatsResponse = await fetch(`/api/formats?url=${encodeURIComponent(url)}`);
-      if(formatsResponse.ok) {
-        const formatsData = await formatsResponse.json();
-        setFormats(formatsData.formats || []);
-        if (formatsData.formats?.length > 0) {
-          setSelectedFormat(formatsData.formats[0].format_id);
-        }
-      }
-
-    } catch (error) {
-      console.error("Error fetching metadata:", error);
-      // Fallback to YouTube thumbnail
-      setThumbnailUrl(
-        `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`
-      );
-    } finally {
-      setIsMetadataLoading(false);
-    }
-  };
-
   useEffect(() => {
     const videoId = getVideoId(url);
-    if (videoId) {
-      // Show skeleton immediately by setting thumbnailUrl
-      setThumbnailUrl("loading");
-      setIsMetadataLoading(true);
-      fetchVideoMetadata(videoId);
-    } else {
-      setThumbnailUrl(null);
-      setMetadata({});
-      setFormats([]);
-      setSelectedFormat('');
-      setIsMetadataLoading(false);
-    }
-  }, [url]);
+    const controller = new AbortController();
+    const { signal } = controller;
+    setMetadata({});
+    setFormats([]);
+    setSelectedFormat('');
+    setFormatsError(null);
+    setIsMetadataLoading(Boolean(videoId));
+    setIsFormatsLoading(Boolean(videoId));
+    setThumbnailUrl(videoId ? `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg` : null);
+    if (!videoId) return () => controller.abort();
 
-  useEffect(() => {
-    if (session?.user?.id) {
-      const storedCount = localStorage.getItem(`bangers-${session.user.id}`);
-      setDownloadCount(storedCount ? parseInt(storedCount) : 0);
-    }
-  }, [session?.user?.id]);
-
-  useEffect(() => {
-    const checkPremiumStatus = async () => {
+    const query = encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`);
+    // Metadata is optional: its failure must not prevent quality selection.
+    void (async () => {
       try {
-        const response = await fetch("/api/user/premium");
+        const response = await fetch(`/api/metadata?url=${query}`, { signal });
+        if (!response.ok) return;
         const data = await response.json();
-        setIsPremium(data.isPremium);
-        setShowPremiumModal(!data.isPremium);
-      } catch (error) {
-        console.error("Error checking premium status:", error);
+        if (signal.aborted) return;
+        setMetadata(data);
+        if (data.image) setThumbnailUrl(data.image);
+      } catch {
+        // Keep the YouTube thumbnail when metadata is unavailable.
+      } finally {
+        if (!signal.aborted) setIsMetadataLoading(false);
       }
-    };
+    })();
 
-    if (session?.user) {
-      checkPremiumStatus();
-    }
-  }, [session]);
+    void (async () => {
+      try {
+        const response = await fetch(`/api/formats?url=${query}`, { signal });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load quality options');
+        if (signal.aborted) return;
+        const available = data.formats || [];
+        setFormats(available);
+        setSelectedFormat(available[0]?.format_id || '');
+        if (!available.length) setFormatsError('No quality options found. Automatic quality will be used.');
+      } catch (error) {
+        if (!signal.aborted) setFormatsError(error instanceof Error ? error.message : 'Could not load quality options');
+      } finally {
+        if (!signal.aborted) setIsFormatsLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [url]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!isPremium) {
-      setShowPremiumModal(true);
-      return;
-    }
-
+    setError(null);
     setLoading(true);
 
     try {
@@ -153,7 +105,6 @@ export default function Editor() {
           cropRatio,
           subtitles: addSubs,
           formatId: selectedFormat,
-          userId: session?.user?.id,
         }),
       });
 
@@ -169,7 +120,6 @@ export default function Editor() {
       interface JobStatusResponse { 
         status: JobStatus; 
         error?: string; 
-        url?: string; 
       }
 
       let status: JobStatus = "processing";
@@ -182,7 +132,7 @@ export default function Editor() {
         if (status === "error") throw new Error(pollJson.error || "Processing failed");
       }
 
-      // Step 3: Download via frontend route (handles Supabase download and cleanup)
+      // Step 3: Download from the local backend
       const downloadRes = await fetch(`/api/clip/${id}/download`);
       if (!downloadRes.ok) throw new Error("Failed to download clip");
 
@@ -193,25 +143,19 @@ export default function Editor() {
       a.download = "clip.mp4";
       document.body.appendChild(a);
       a.click();
-      window.URL.revokeObjectURL(downloadUrl);
+      setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 60000);
       a.remove();
 
-      // Update download count
-      const newCount = downloadCount + 1;
-      if (session?.user?.id) {
-        localStorage.setItem(`bangers-${session.user.id}`, String(newCount));
-      }
-      setDownloadCount(newCount);
+      setDownloadCount((count) => count + 1);
+      // Only remove the temporary file after the browser has received all bytes.
+      const cleanup = await fetch(`/api/clip/${id}/cleanup`, { method: "DELETE" });
+      if (!cleanup.ok) setError("Download started, but the temporary clip could not be removed.");
     } catch (err) {
       console.error("Error in handleSubmit:", err);
-      // Add user-friendly error handling here
+      setError(err instanceof Error ? err.message : "Could not download clip");
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleLogout = () => {
-    authClient.signOut();
   };
 
   const resolutionOptions = {
@@ -222,33 +166,10 @@ export default function Editor() {
 
   return (
     <main className="flex flex-col w-full h-full min-h-screen p-4 gap-4 max-w-3xl mx-auto items-center justify-center">
-      <nav className="flex flex-col w-full gap-4 fixed top-0 left-0 right-0 z-20">
-        <div className="flex flex-col gap-6 p-4">
-          <div className="flex justify-between items-start">
-            <motion.button
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              transition={{ delay: 0.4 }}
-              className="font-medium rounded-full border py-2 bg-card px-4 cursor-pointer hover:bg-card/50"
-            >
-              👋 Hey, {session?.user.name.split(" ")[0]}!
-            </motion.button>
-            <motion.span
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              transition={{ delay: 0.4 }}
-            >
-              <Button variant="destructive" size="icon" onClick={handleLogout}>
-                <LogOut className="h-5 w-5" />
-              </Button>
-            </motion.span>
-          </div>
-        </div>
-      </nav>
+      <p className="text-sm text-muted-foreground">Clips stay on this computer. Downloads use your browser’s save settings.</p>
 
       <section className="flex flex-col w-full gap-4 max-w-xl mx-auto transition-all duration-300">
+        {error && <p role="alert" className="text-red-500">{error}</p>}
         <AnimatePresence mode="wait">
           {!isMetadataLoading && thumbnailUrl === null ? (
             <motion.h1
@@ -327,7 +248,7 @@ export default function Editor() {
               required
               className="bg-transparent border-none outline-none w-full"
             />
-            <Button type="submit" size="icon" disabled={loading}>
+            <Button type="submit" size="icon" disabled={loading} aria-label="Download clip">
               {loading ? (
                 <Loader2 className="w-6 h-6 animate-spin" />
               ) : (
@@ -424,10 +345,12 @@ export default function Editor() {
                     backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`,
                     backgroundPosition: 'right 8px center'
                   }}
-                  disabled={formats.length === 0}
+                  disabled={isFormatsLoading || formats.length === 0}
+                  aria-busy={isFormatsLoading}
+                  aria-describedby={formatsError ? 'quality-error' : undefined}
                 >
                   {formats.length === 0 ? (
-                    <option value="">Loading formats...</option>
+                    <option value="">{isFormatsLoading ? 'Loading formats...' : getVideoId(url) ? 'Automatic quality' : 'Enter a YouTube URL'}</option>
                   ) : (
                     formats.map((format) => (
                       <option key={format.format_id} value={format.format_id}>
@@ -436,6 +359,7 @@ export default function Editor() {
                     ))  
                   )}
                 </select>
+                {formatsError && <p id="quality-error" role="status" className="text-sm text-muted-foreground">{formatsError}</p>}
               </div>
 
               <div className="flex flex-col gap-2 flex-1">
@@ -467,19 +391,7 @@ export default function Editor() {
           )}
         </AnimatePresence>
       </section>
-      {showPremiumModal && (
-        <Buy
-          isOpen={showPremiumModal}
-          setIsOpen={setShowPremiumModal}
-          product={{
-            product_id: process.env.NEXT_PUBLIC_DODO_PAYMENTS_PRODUCT_ID!,
-            name: "Starter",
-            description: "Servers don't come cheap 🤷🏻",
-            price: "2.40",
-            currency: "$",
-          }}
-        />
-      )}
+
     </main>
   );
 }

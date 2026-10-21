@@ -1,3 +1,4 @@
+import { backendUrl } from "@/lib/backend";
 import { NextResponse } from 'next/server';
 
 export async function GET(request: Request) {
@@ -8,7 +9,6 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'url is required' }, { status: 400 });
   }
 
-  const backendUrl = process.env.BACKEND_API_URL || 'http://localhost:3001';
 
   try {
     const response = await fetch(`${backendUrl}/api/formats?url=${encodeURIComponent(url)}`);
