@@ -10,20 +10,31 @@ if ($null -eq (Get-Command bun -ErrorAction SilentlyContinue)) {
 function Stop-Backend {
     if ($null -ne $backendProcess -and -not $backendProcess.HasExited) {
         Write-Host "Stopping backend..."
-        Stop-Process -Id $backendProcess.Id -Force
+        # Stop the watcher and any downloader/encoder it started.
+        & taskkill /PID $backendProcess.Id /T /F | Out-Null
     }
 }
 
 try {
+    $portProbe = New-Object System.Net.Sockets.TcpClient
+    try {
+        $portProbe.Connect('127.0.0.1', 3001)
+        throw "Port 3001 is already in use. Stop the existing backend before starting this app."
+    } catch [System.Net.Sockets.SocketException] {
+        # Nothing is listening; this launcher can own the backend port.
+    } finally {
+        $portProbe.Dispose()
+    }
+
     Write-Host "Starting backend..."
     $backendProcess = Start-Process `
         -FilePath "bun" `
-        -ArgumentList "run", "dev" `
+        -ArgumentList "--watch", "run", "src/index.ts" `
         -WorkingDirectory (Join-Path $rootDir "backend") `
         -NoNewWindow `
         -PassThru
 
-    Write-Host "Waiting for backend at http://localhost:3001..."
+    Write-Host "Waiting for backend at http://127.0.0.1:3001..."
     $backendReady = $false
 
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
@@ -35,7 +46,7 @@ try {
 
         try {
             Invoke-WebRequest `
-                -Uri "http://localhost:3001/api/ping" `
+                -Uri "http://127.0.0.1:3001/api/ping" `
                 -UseBasicParsing `
                 -TimeoutSec 2 | Out-Null
             $backendReady = $true

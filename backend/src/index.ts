@@ -5,6 +5,7 @@ import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import { randomUUID } from "crypto";
+import { preparePostLiveInputs } from './post-live';
 
 dotenv.config();
 
@@ -39,11 +40,52 @@ const bundledYtDlp = path.resolve(__dirname, process.platform === 'win32' ? '../
 const ytDlpPath = fs.existsSync(bundledYtDlp) ? bundledYtDlp : 'yt-dlp';
 const bundledFfmpeg = path.resolve(__dirname, '../bin/ffmpeg.exe');
 const ffmpegPath = process.platform === 'win32' && fs.existsSync(bundledFfmpeg) ? bundledFfmpeg : 'ffmpeg';
+const bundledFfprobe = path.resolve(__dirname, '../bin/ffprobe.exe');
+const ffprobePath = process.platform === 'win32' && fs.existsSync(bundledFfprobe) ? bundledFfprobe : 'ffprobe';
 const ytDlpToolArgs = [
   '--js-runtimes', `bun:${process.execPath}`,
   ...(ffmpegPath === bundledFfmpeg ? ['--ffmpeg-location', path.dirname(bundledFfmpeg)] : []),
+  '--no-playlist',
 ];
 function createJobId() { return randomUUID(); }
+
+async function readToolJson(command: string, args: string[]): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args);
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error(`${path.basename(command)} inspection timed out; please retry`));
+    }, 30000);
+    child.stdout.on('data', data => { stdout += data.toString(); });
+    child.stderr.on('data', data => { stderr = (stderr + data.toString()).slice(-4000); });
+    child.on('error', error => { clearTimeout(timeout); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(`${path.basename(command)} inspection failed: ${stderr.trim() || `exit code ${code}`}`));
+        return;
+      }
+      try { resolve(JSON.parse(stdout)); } catch {
+        reject(new Error(`${path.basename(command)} returned invalid metadata`));
+      }
+    });
+  });
+}
+
+async function validateClip(filePath: string, expectedDuration?: number): Promise<void> {
+  const info = await readToolJson(ffprobePath, [
+    '-v', 'error', '-show_entries', 'stream=codec_type:format=duration', '-of', 'json', filePath,
+  ]);
+  if (!info.streams?.some((stream: { codec_type: string }) => stream.codec_type === 'video') ||
+      !(Number(info.format?.duration) > 0)) {
+    throw new Error('The requested section contains no video. Check the timestamps; if this was a livestream, wait for YouTube to finish processing the recording and retry.');
+  }
+  if (expectedDuration !== undefined && Math.abs(Number(info.format.duration) - expectedDuration) > 0.5) {
+    throw new Error('The downloaded clip is incomplete. YouTube may no longer have all requested livestream fragments; please retry later.');
+  }
+}
 
 function timeToSeconds(timeStr: string): number {
   const parts = timeStr.split(':');
@@ -156,23 +198,44 @@ app.post("/api/clip", async (req, res) => {
         }
       }
 
-      console.log(`[job ${id}] starting yt-dlp`);
-      const yt = spawn(ytDlpPath, ytArgs);
-      yt.stderr.on('data', d => console.error(`[job ${id}]`, d.toString()));
+      const info = await readToolJson(ytDlpPath, [
+        ...ytArgs, '--skip-download', '--dump-single-json', '--no-write-subs', '--no-write-auto-subs',
+      ]);
+      const postLive = info.live_status === 'post_live';
+      if (info.is_live || info.live_status === 'is_live' || info.live_status === 'is_upcoming') {
+        throw new Error('This video is live or has not started. Wait for the broadcast to end and YouTube to finish processing its recording before clipping.');
+      }
+      if (typeof info.duration === 'number' && timeToSeconds(endTime) > info.duration) {
+        throw new Error('The requested end time exceeds the video duration. Choose a section within the video.');
+      }
 
-      await new Promise<void>((resolve, reject) => {
-        yt.on('close', (code, signal) => {
-          if (code === 0) {
-            resolve();
-          } else if (code === null) {
-            reject(new Error(`yt-dlp process was killed by signal: ${signal || 'unknown'}`));
-          } else {
-            reject(new Error(`yt-dlp exited with code ${code}`));
-          }
+      const postLiveInputs = postLive ? await preparePostLiveInputs(
+        info, timeToSeconds(startTime), timeToSeconds(endTime), outputPath, ffprobePath, readToolJson,
+      ) : null;
+      // Post-live sections are assembled from timestamped fragments. yt-dlp's
+      // ffmpeg section downloader instead opens the final fragment's base URL.
+      if (postLive && subtitles) ytArgs.push('--skip-download');
+      if (!postLive || subtitles) {
+        console.log(`[job ${id}] starting yt-dlp`);
+        const yt = spawn(ytDlpPath, ytArgs);
+        yt.stdout.resume();
+        yt.stderr.on('data', d => console.error(`[job ${id}]`, d.toString()));
+
+        await new Promise<void>((resolve, reject) => {
+          yt.on('close', (code, signal) => {
+            if (code === 0) {
+              resolve();
+            } else if (code === null) {
+              reject(new Error(`yt-dlp process was killed by signal: ${signal || 'unknown'}`));
+            } else {
+              reject(new Error(`yt-dlp exited with code ${code}`));
+            }
+          });
+          yt.on('error', reject);
         });
-        yt.on('error', reject);
-      });
+      }
 
+      if (!postLive) await validateClip(outputPath);
       const fastPath = path.join(uploadsDir, `clip-${id}-fast.mp4`);
       const subPath = outputPath.replace(/\.mp4$/, ".en.vtt");
       const subtitlesExist = fs.existsSync(subPath);
@@ -188,7 +251,7 @@ app.post("/api/clip", async (req, res) => {
       await new Promise<void>((resolve, reject) => {
         const ffmpegArgs = [
           '-y',
-          '-i', outputPath,
+          ...(postLiveInputs || ['-i', outputPath]),
         ];
 
         if (subtitles && subtitlesExist) {
@@ -204,9 +267,10 @@ app.post("/api/clip", async (req, res) => {
             '-bufsize', '4M'         // Limit buffer size
           );
         } else {
-          // No subtitles to burn – copy video but transcode audio to AAC to ensure MP4 compatibility
+          // Post-live cuts need decoding at the boundary; ordinary clips are already trimmed.
           ffmpegArgs.push(
-            '-c:v', 'copy', // keep original video
+            '-c:v', postLive ? 'libx264' : 'copy',
+            ...(postLive ? ['-preset', 'fast'] : []),
             '-c:a', 'aac',
             '-b:a', '128k'
           );
@@ -244,6 +308,7 @@ app.post("/api/clip", async (req, res) => {
         });
       });
 
+      await validateClip(fastPath, postLive ? timeToSeconds(endTime) - timeToSeconds(startTime) : undefined);
       await fs.promises.unlink(outputPath).catch(()=>{});
       await fs.promises.rename(fastPath, outputPath);
 
@@ -255,9 +320,20 @@ app.post("/api/clip", async (req, res) => {
     } catch (err: unknown) {
       console.error(`[job ${id}] failed`, err);
       const message = err instanceof Error ? err.message : String(err);
-      job.status = 'error';
+      // Remove only this failed job's media and sidecars, including .part files.
+      for (const name of await fs.promises.readdir(uploadsDir).catch(() => [])) {
+        if (name.startsWith(`clip-${id}.`) || name.startsWith(`clip-${id}-`)) {
+          await fs.promises.rm(path.join(uploadsDir, name), { force: true }).catch(() => {});
+        }
+      }
       job.error = message;
+      job.status = 'error';
     } finally {
+      for (const name of await fs.promises.readdir(uploadsDir).catch(() => [])) {
+        if (name.startsWith(`clip-${id}.mp4-track-`)) {
+          await fs.promises.rm(path.join(uploadsDir, name), { force: true }).catch(() => {});
+        }
+      }
       if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
         fs.unlinkSync(tempCookiesPath);
       }

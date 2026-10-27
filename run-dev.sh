@@ -23,7 +23,7 @@ trap cleanup EXIT INT TERM
 echo "Starting backend..."
 (
   cd "$ROOT_DIR/backend"
-  exec bun run dev
+  exec bun --watch run src/index.ts
 ) &
 BACKEND_PID=$!
 
